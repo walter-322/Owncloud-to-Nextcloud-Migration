@@ -1,0 +1,369 @@
+================================================================================
+   TUTORIAL: Migrating from OwnCloud 10.15.x to Nextcloud 25/26
+   on Debian Linux (Same Database, Same Data Folder, Zero Data Loss)
+================================================================================
+
+Author: Walter Mueller
+Tested on: Debian Linux, OwnCloud 10.15.3 → Nextcloud 25.0.13
+Date: 2026
+IMPORTANT!: You might even not understand some stuff here, if you are unsure (and i know you wont be sure), you better Call me in Issues and i will join cause i have been already through this suffering process.
+
+--------------------------------------------------------------------------------
+OVERVIEW
+--------------------------------------------------------------------------------
+
+This tutorial walks you through migrating from OwnCloud 10.15.x to Nextcloud 25
+while keeping the same MariaDB/MySQL database, same data folder, and same config.
+No data will be lost if you follow each step carefully.
+
+IMPORTANT: You cannot jump directly from OwnCloud to Nextcloud 26+.
+You must land on Nextcloud 25 first, then upgrade to 26 separately.
+
+--------------------------------------------------------------------------------
+REQUIREMENTS
+--------------------------------------------------------------------------------
+
+  - Debian Linux (tested on Debian 13)
+  - OwnCloud 10.13.x - 10.15.x installed
+  - MariaDB or MySQL database
+  - Root or sudo access
+  - PHP 7.4 installed (for NC25), PHP 8.1 (for NC26)
+  - At least 2GB free disk space for backups
+
+--------------------------------------------------------------------------------
+STEP 1: BACKUP EVERYTHING
+--------------------------------------------------------------------------------
+
+Never skip this step. If something goes wrong, you can restore.
+
+  # Backup your database
+  mysqldump -u root -p your_db_name > owncloud_backup_$(date +%Y%m%d).sql
+
+  # Backup your data folder
+  cp -r /var/www/html/owncloud/data /backup/owncloud_data_backup
+
+  # Backup OwnCloud config
+  cp /var/www/html/owncloud/config/config.php /backup/owncloud_config.php.bak
+
+  # Note down your instanceid (you will need it later!)
+  grep instanceid /var/www/html/owncloud/config/config.php
+
+--------------------------------------------------------------------------------
+STEP 2: PUT OWNCLOUD INTO MAINTENANCE MODE
+--------------------------------------------------------------------------------
+
+  sudo -u www-data php7.4 /var/www/html/owncloud/occ maintenance:mode --on
+
+--------------------------------------------------------------------------------
+STEP 3: FIX DATABASE COLUMN SIZES
+--------------------------------------------------------------------------------
+
+OwnCloud has some columns that are too small for Nextcloud's data.
+Fix them before migrating:
+
+  mysql -u root -p
+
+  USE your_db_name;
+
+  ALTER TABLE oc_appconfig MODIFY COLUMN configvalue VARCHAR(4000);
+
+  -- Drop columns that will conflict with Nextcloud schema
+  ALTER TABLE oc_mounts DROP COLUMN IF EXISTS mount_id;
+  ALTER TABLE oc_authtoken DROP COLUMN IF EXISTS scope;
+  ALTER TABLE oc_authtoken DROP COLUMN IF EXISTS token_type;
+  ALTER TABLE oc_authtoken DROP COLUMN IF EXISTS refresh_token;
+  ALTER TABLE oc_share DROP COLUMN IF EXISTS share_with_displayname;
+
+  EXIT;
+
+--------------------------------------------------------------------------------
+STEP 4: INSERT REQUIRED VERSION ROWS INTO DATABASE
+--------------------------------------------------------------------------------
+
+Nextcloud needs specific version keys in oc_appconfig to proceed:
+
+  mysql -u root -p
+
+  USE your_db_name;
+
+  -- Check what is already there
+  SELECT appid, configkey, configvalue FROM oc_appconfig WHERE appid = 'core';
+
+  -- Insert missing version rows (only if they don't already exist)
+  INSERT INTO oc_appconfig (appid, configkey, configvalue)
+    VALUES ('core', 'installedVersion', '25.0.0.0');
+
+  INSERT INTO oc_appconfig (appid, configkey, configvalue)
+    VALUES ('core', 'lastVersion', '25.0.0');
+
+  -- Set vendor to owncloud
+  INSERT INTO oc_appconfig (appid, configkey, configvalue)
+    VALUES ('core', 'vendor', 'owncloud');
+
+  EXIT;
+
+--------------------------------------------------------------------------------
+STEP 5: DOWNLOAD NEXTCLOUD 25
+--------------------------------------------------------------------------------
+
+  cd /var/www/html
+
+  # Download NC25 (latest 25.x release)
+  wget https://download.nextcloud.com/server/releases/nextcloud-25.0.13.tar.bz2
+  tar -xvf nextcloud-25.0.13.tar.bz2
+
+  # This creates a folder called "nextcloud"
+  # Rename your old owncloud folder if needed
+  mv owncloud owncloud_backup
+
+--------------------------------------------------------------------------------
+STEP 6: CONFIGURE NEXTCLOUD config.php
+--------------------------------------------------------------------------------
+
+Create or edit /var/www/html/nextcloud/config/config.php:
+
+  nano /var/www/html/nextcloud/config/config.php
+
+It must contain:
+
+  <?php
+  $CONFIG = array (
+    'installed'      => true,
+    'dbtype'         => 'mysql',
+    'dbname'         => 'your_db_name',       // same as OwnCloud
+    'dbuser'         => 'your_db_user',
+    'dbpassword'     => 'your_db_password',
+    'dbhost'         => 'localhost',
+    'dbtableprefix'  => 'oc_',
+    'datadirectory'  => '/your/data/folder',  // same as OwnCloud
+    'instanceid'     => 'YOUR_OWNCLOUD_INSTANCEID', // CRITICAL: copy from OwnCloud
+    'version'        => '10.15.3.0',          // must match OwnCloud version
+  );
+
+  CRITICAL NOTES:
+  - 'installed' must be TRUE
+  - 'instanceid' must match OwnCloud exactly (ties users to encryption keys)
+  - 'version' must be set to your OwnCloud version (e.g. 10.15.3.0)
+    NOT the Nextcloud version — this tells Nextcloud where to upgrade FROM
+
+--------------------------------------------------------------------------------
+STEP 7: PATCH version.php TO ALLOW YOUR OWNCLOUD VERSION
+--------------------------------------------------------------------------------
+
+Nextcloud 25 by default only allows upgrading from OwnCloud 10.13.
+If you are on 10.14 or 10.15, you must patch version.php:
+
+  nano /var/www/html/nextcloud/version.php
+
+Find this section:
+
+  'owncloud' =>
+  array (
+    '10.13' => true,
+  ),
+
+Change it to:
+
+  'owncloud' =>
+  array (
+    '10.13' => true,
+    '10.14' => true,
+    '10.15' => true,
+  ),
+
+Save and exit.
+
+--------------------------------------------------------------------------------
+STEP 8: PATCH Updater.php TO ALLOW THE UPGRADE
+--------------------------------------------------------------------------------
+
+There is a version comparison check in Nextcloud's updater that may still block
+the upgrade. Find the file:
+
+  grep -n "multiple major versions" /var/www/html/nextcloud/lib/private/Updater.php
+
+Open the file and locate the isUpgradePossible() function.
+The key check is at the bottom — it verifies the vendor and version match.
+If you followed Steps 4 and 6 correctly (vendor = owncloud, version = 10.15.3.0),
+this should pass automatically.
+
+If you still get "Updates between multiple major versions are unsupported":
+
+  # Check what version Nextcloud is reading
+  grep version /var/www/html/nextcloud/config/config.php
+
+  Make sure it shows: 'version' => '10.15.3.0'
+  NOT: 'version' => '25.0.x.x'
+
+--------------------------------------------------------------------------------
+STEP 9: SET CORRECT PERMISSIONS
+--------------------------------------------------------------------------------
+
+  chown -R www-data:www-data /var/www/html/nextcloud
+  chmod -R 750 /var/www/html/nextcloud
+
+--------------------------------------------------------------------------------
+STEP 10: RUN THE UPGRADE
+--------------------------------------------------------------------------------
+
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ upgrade
+
+You should see output like:
+
+  Updating database schema
+  Updated database
+  Updating <federation> ...
+  Updating <files> ...
+  Updating <dav> ...
+  ...
+  Update successful
+
+If you see errors about columns already existing, fix them:
+
+  mysql -u root -p
+  USE your_db_name;
+  ALTER TABLE oc_[tablename] DROP COLUMN IF EXISTS [columnname];
+  EXIT;
+
+Then re-run occ upgrade.
+
+--------------------------------------------------------------------------------
+STEP 11: POST-UPGRADE CLEANUP
+--------------------------------------------------------------------------------
+
+  # Turn off maintenance mode
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ maintenance:mode --off
+
+  # Fix missing database indices and columns
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ db:add-missing-indices
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ db:add-missing-columns
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ db:add-missing-primary-keys
+
+  # Run repair
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ maintenance:repair
+
+  # Rescan all files
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ files:scan --all
+
+  # Clear cache
+  sudo -u www-data php7.4 /var/www/html/nextcloud/occ cache:clear
+
+--------------------------------------------------------------------------------
+STEP 12: FIX PHP MEMORY LIMIT WARNING
+--------------------------------------------------------------------------------
+
+  nano /etc/php/7.4/fpm/php.ini
+
+Change these values:
+
+  memory_limit = 512M
+  upload_max_filesize = 512M
+  post_max_size = 512M
+  max_execution_time = 360
+  max_input_time = 360
+  output_buffering = Off
+
+  systemctl restart php7.4-fpm
+  systemctl restart apache2
+
+--------------------------------------------------------------------------------
+OPTIONAL: UPGRADE TO NEXTCLOUD 26
+--------------------------------------------------------------------------------
+
+NC26 requires PHP 8.0 or higher. PHP 7.4 will NOT work.
+
+  -- Install PHP 8.1 --
+
+  apt install -y lsb-release apt-transport-https ca-certificates wget
+  wget -O /etc/apt/trusted.gpg.d/php.gpg https://packages.sury.org/php/apt.gpg
+  echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" \
+    > /etc/apt/sources.list.d/php.list
+  apt update
+
+  apt install -y php8.1 php8.1-cli php8.1-fpm php8.1-mysql php8.1-xml \
+  php8.1-curl php8.1-gd php8.1-mbstring php8.1-zip php8.1-intl \
+  php8.1-bcmath php8.1-gmp php8.1-imagick php8.1-redis
+
+  -- Switch Apache to PHP 8.1 FPM --
+
+  a2enmod proxy_fcgi setenvif
+  a2enconf php8.1-fpm
+  systemctl enable php8.1-fpm
+  systemctl start php8.1-fpm
+  systemctl restart apache2
+
+  -- Set PHP 8.1 as default --
+
+  update-alternatives --set php /usr/bin/php8.1
+
+  -- Download and install NC26 --
+
+  cd /var/www/html
+  wget https://download.nextcloud.com/server/releases/nextcloud-26.0.13.tar.bz2
+  tar -xvf nextcloud-26.0.13.zip -d nextcloud26
+  cp nextcloud/config/config.php nextcloud26/config/config.php
+  mv nextcloud nextcloud25_backup
+  mv nextcloud26 nextcloud
+  chown -R www-data:www-data nextcloud
+
+  -- Run upgrade --
+
+  sudo -u www-data php8.1 /var/www/html/nextcloud/occ upgrade
+
+  -- Post upgrade --
+
+  sudo -u www-data php8.1 /var/www/html/nextcloud/occ maintenance:mode --off
+  sudo -u www-data php8.1 /var/www/html/nextcloud/occ db:add-missing-indices
+  sudo -u www-data php8.1 /var/www/html/nextcloud/occ maintenance:repair
+
+  -- Fix PHP memory for 8.1 --
+
+  nano /etc/php/8.1/fpm/php.ini
+  (set same values as Step 12 above)
+  systemctl restart php8.1-fpm
+
+--------------------------------------------------------------------------------
+COMMON ERRORS AND FIXES
+--------------------------------------------------------------------------------
+
+ERROR: "String data, right truncated: 1406 Data too long for column 'version'"
+FIX:   ALTER TABLE oc_appconfig MODIFY COLUMN configvalue VARCHAR(4000);
+
+ERROR: "The column 'X' on table 'oc_Y' already exists"
+FIX:   ALTER TABLE oc_Y DROP COLUMN IF EXISTS X;
+
+ERROR: "Table 'owncloud.oc_appconfig' doesn't exist"
+FIX:   Your config.php is pointing to the wrong database name.
+       Check: grep dbname /var/www/html/nextcloud/config/config.php
+       And:   grep dbname /var/www/html/owncloud/config/config.php
+       They must match.
+
+ERROR: "Updates between multiple major versions and downgrades are unsupported"
+FIX:   1. Make sure 'version' in config.php = '10.15.3.0' (OwnCloud version)
+       2. Make sure version.php allows '10.15'
+       3. Make sure 'vendor' = 'owncloud' in oc_appconfig
+
+ERROR: "Nextcloud is not installed"
+FIX:   Add 'installed' => true to config.php
+
+ERROR: "This version of Nextcloud requires at least PHP 8.0"
+FIX:   You are using NC26 with PHP 7.4. Install PHP 8.1 (see Optional section)
+
+--------------------------------------------------------------------------------
+IMPORTANT NOTES
+--------------------------------------------------------------------------------
+
+  * Always keep 'instanceid' the same as OwnCloud — changing it breaks
+    user accounts and encryption keys.
+
+  * Keep your OwnCloud folder as a backup until NC is confirmed working.
+
+  * After migration, disabled apps (market, configreport, files_mediaviewer)
+    are OwnCloud-specific and do not exist in Nextcloud. This is normal.
+
+  * If you have encrypted files, test decryption after migration before
+    deleting any backups.
+
+================================================================================
+END OF TUTORIAL
+================================================================================
